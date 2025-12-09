@@ -58,14 +58,117 @@ class DebrisVisualizer {
             }
         }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
         
-        // Set initial camera position
+        // Add equator line
+        this.addEquator();
+        
+        // Set initial camera position - Europe view with North Pole visible
+        // Center on Europe: ~10°E longitude, ~50°N latitude (central Europe)
         this.viewer.camera.setView({
-            destination: Cesium.Cartesian3.fromDegrees(0, 0, 20000000),
+            destination: Cesium.Cartesian3.fromDegrees(10, 50, 18000000), // Central Europe, zoomed out to see continent
+            orientation: {
+                heading: Cesium.Math.toRadians(0), // North up
+                pitch: Cesium.Math.toRadians(-50), // 50° down for better view
+                roll: 0.0
+            }
         });
 
         // Update clock
         this.viewer.clock.onTick.addEventListener(() => {
             this.updatePositions();
+        });
+    }
+    
+    addEquator() {
+        // Create equator line (latitude 0°)
+        const positions = [];
+        const steps = 360; // One point per degree
+        
+        for (let i = 0; i <= steps; i++) {
+            const longitude = Cesium.Math.toRadians(i);
+            const latitude = 0; // Equator
+            positions.push(Cesium.Cartesian3.fromRadians(longitude, latitude));
+        }
+        
+        // Add equator entity
+        this.viewer.entities.add({
+            id: 'equator',
+            name: 'Equator',
+            polyline: {
+                positions: positions,
+                width: 2,
+                material: Cesium.Color.YELLOW.withAlpha(0.6),
+                clampToGround: false,
+                arcType: Cesium.ArcType.GEODESIC,
+            },
+        });
+        
+        // Add North Pole marker
+        this.viewer.entities.add({
+            id: 'north_pole',
+            name: 'North Pole',
+            position: Cesium.Cartesian3.fromDegrees(0, 90, 0),
+            point: {
+                pixelSize: 8,
+                color: Cesium.Color.CYAN,
+                outlineColor: Cesium.Color.WHITE,
+                outlineWidth: 2,
+            },
+            label: {
+                text: 'N',
+                font: '16px sans-serif',
+                fillColor: Cesium.Color.CYAN,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -15),
+            },
+        });
+        
+        // Add South Pole marker
+        this.viewer.entities.add({
+            id: 'south_pole',
+            name: 'South Pole',
+            position: Cesium.Cartesian3.fromDegrees(0, -90, 0),
+            point: {
+                pixelSize: 8,
+                color: Cesium.Color.CYAN,
+                outlineColor: Cesium.Color.WHITE,
+                outlineWidth: 2,
+            },
+            label: {
+                text: 'S',
+                font: '16px sans-serif',
+                fillColor: Cesium.Color.CYAN,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -15),
+            },
+        });
+        
+        // Add London marker for reference
+        this.viewer.entities.add({
+            id: 'london',
+            name: 'London',
+            position: Cesium.Cartesian3.fromDegrees(-0.1276, 51.5074, 0),
+            point: {
+                pixelSize: 6,
+                color: Cesium.Color.WHITE,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 1,
+            },
+            label: {
+                text: 'London',
+                font: '12px sans-serif',
+                fillColor: Cesium.Color.WHITE,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -10),
+            },
         });
     }
 
@@ -341,15 +444,160 @@ class DebrisVisualizer {
         // Show orbit path
         this.showOrbitPath(noradId, entity._debrisData);
         
-        // Fly to entity
-        this.viewer.flyTo(entity);
+        // Animate the entity along its orbit
+        const animationSpeed = this.animateEntity(entity);
         
-        // Show info panel
-        this.showEntityInfo(entity);
+        // Zoom out to show orbit (don't zoom into object)
+        this.zoomToOrbit(entity);
+        
+        // Show info panel with animation speed
+        this.showEntityInfo(entity, animationSpeed);
+    }
+    
+    zoomToOrbit(entity) {
+        // Get the orbit path entity
+        const noradId = entity.properties?.noradId?.getValue();
+        const orbitEntity = this.orbitPaths.get(noradId);
+        
+        if (orbitEntity && orbitEntity.polyline) {
+            // Fly to the orbit path (shows the whole orbit)
+            this.viewer.flyTo(orbitEntity.polyline, {
+                duration: 2.0,
+                offset: new Cesium.HeadingPitchRange(
+                    0, // Heading (north)
+                    Cesium.Math.toRadians(-45), // Pitch (45 degrees down)
+                    0 // Range (auto-calculate to fit)
+                )
+            });
+        } else {
+            // Fallback: zoom out from entity
+            const position = entity.position.getValue();
+            const cartographic = Cesium.Cartographic.fromCartesian(position);
+            const height = Math.max(10000000, cartographic.height * 3); // Zoom out 3x or min 10,000km
+            
+            this.viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromRadians(
+                    cartographic.longitude,
+                    cartographic.latitude,
+                    height
+                ),
+                orientation: {
+                    heading: 0,
+                    pitch: Cesium.Math.toRadians(-45),
+                    roll: 0
+                },
+                duration: 2.0
+            });
+        }
+    }
+    
+    animateEntity(entity) {
+        const debris = entity._debrisData;
+        if (!debris || (!debris.satrec && (!debris.line1 || !debris.line2))) {
+            return 1;
+        }
+        
+        // Get or create satrec
+        let satrec = debris.satrec;
+        if (!satrec && debris.line1 && debris.line2) {
+            try {
+                const twoline2satrec = satellite.twoline2satrec || 
+                                     (satellite.default && satellite.default.twoline2satrec);
+                if (twoline2satrec) {
+                    satrec = twoline2satrec(debris.line1, debris.line2);
+                } else {
+                    return 1;
+                }
+            } catch (error) {
+                console.error('Failed to create satrec for animation:', error);
+                return 1;
+            }
+        }
+        
+        if (!satrec) return 1;
+        
+        // Store original position if not already animated
+        if (!entity._isAnimated) {
+            entity._originalPosition = entity.position.getValue();
+            entity._isAnimated = true;
+        }
+        
+        // Calculate orbital period
+        const periodMinutes = 1440 / debris.meanMotion;
+        const periodSeconds = periodMinutes * 60;
+        
+        // Speed up animation (1 orbit per 30 seconds instead of real-time)
+        const animationSpeed = periodSeconds / 30; // Compress time
+        const speedMultiplier = Math.round(animationSpeed); // Round for display
+        
+        // Set up time-dependent position using CallbackProperty
+        entity.position = new Cesium.CallbackProperty((time, result) => {
+            if (!time) {
+                return entity._originalPosition || Cesium.Cartesian3.ZERO;
+            }
+            
+            // Convert Cesium time to JavaScript Date
+            const date = Cesium.JulianDate.toDate(time);
+            
+            // Calculate time offset for animation (speed up)
+            const startTime = Cesium.JulianDate.toDate(this.viewer.clock.startTime);
+            const elapsedSeconds = (date.getTime() - startTime.getTime()) / 1000;
+            const animatedSeconds = elapsedSeconds * animationSpeed;
+            const animatedDate = new Date(startTime.getTime() + animatedSeconds * 1000);
+            
+            try {
+                const propagate = satellite.propagate || 
+                                 (satellite.default && satellite.default.propagate);
+                if (!propagate) {
+                    return entity._originalPosition || Cesium.Cartesian3.ZERO;
+                }
+                
+                const result_prop = propagate(satrec, animatedDate);
+                if (result_prop && result_prop.position && !result_prop.error) {
+                    const pos = result_prop.position;
+                    if (isFinite(pos.x) && isFinite(pos.y) && isFinite(pos.z)) {
+                        return Cesium.Cartesian3.fromElements(
+                            pos.x * 1000,
+                            pos.y * 1000,
+                            pos.z * 1000,
+                            result
+                        );
+                    }
+                }
+            } catch (error) {
+                // Fallback to original position
+            }
+            
+            return entity._originalPosition || Cesium.Cartesian3.ZERO;
+        }, false);
+        
+        // Set up animation time range (one orbit period)
+        const now = Cesium.JulianDate.now();
+        const startTime = Cesium.JulianDate.clone(now);
+        const stopTime = Cesium.JulianDate.addSeconds(startTime, 30, new Cesium.JulianDate()); // 30 seconds for one orbit
+        
+        // Configure clock for animation
+        this.viewer.clock.startTime = startTime.clone();
+        this.viewer.clock.stopTime = stopTime.clone();
+        this.viewer.clock.currentTime = startTime.clone();
+        this.viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP; // Loop the animation
+        this.viewer.clock.multiplier = 1; // Normal speed (we handle speed in CallbackProperty)
+        
+        // Start animation
+        this.viewer.clock.shouldAnimate = true;
     }
     
     deselectEntity() {
         if (this.selectedEntity) {
+            // Stop animation and restore static position
+            if (this.selectedEntity._isAnimated) {
+                const originalPos = this.selectedEntity._originalPosition;
+                if (originalPos) {
+                    this.selectedEntity.position = originalPos;
+                }
+                this.selectedEntity._isAnimated = false;
+            }
+            
             // Restore original appearance
             if (this.selectedEntity.point && this.selectedEntity._originalColor) {
                 this.selectedEntity.point.color = this.selectedEntity._originalColor;
@@ -365,6 +613,9 @@ class DebrisVisualizer {
             }
             this.selectedEntity = null;
         }
+        
+        // Stop animation
+        this.viewer.clock.shouldAnimate = false;
         
         // Hide orbit paths
         this.hideOrbitPaths();
@@ -464,7 +715,7 @@ class DebrisVisualizer {
         this.orbitPaths.clear();
     }
     
-    showEntityInfo(entity) {
+    showEntityInfo(entity, animationSpeed = null) {
         const debris = entity._debrisData;
         if (!debris) return;
         
@@ -472,15 +723,25 @@ class DebrisVisualizer {
         if (!infoDiv) return;
         
         const name = debris.objectName || debris.name || `NORAD ${debris.noradId}`;
-        const info = `
+        const periodMinutes = debris.meanMotion ? (1440 / debris.meanMotion) : null;
+        
+        let info = `
             <h4 style="margin-top: 0; color: #4CAF50;">${name}</h4>
             <p><strong>NORAD ID:</strong> ${debris.noradId}</p>
             <p><strong>Type:</strong> ${debris.objectType || 'UNKNOWN'}</p>
             <p><strong>Orbit:</strong> ${debris.orbitType || 'UNKNOWN'}</p>
             ${debris.inclination ? `<p><strong>Inclination:</strong> ${debris.inclination.toFixed(2)}°</p>` : ''}
-            ${debris.meanMotion ? `<p><strong>Period:</strong> ${(1440 / debris.meanMotion).toFixed(2)} min</p>` : ''}
-            <p style="margin-top: 10px; font-size: 11px; color: #999;"><em>Click elsewhere to deselect</em></p>
+            ${periodMinutes ? `<p><strong>Orbital Period:</strong> ${periodMinutes.toFixed(2)} min (${(periodMinutes / 60).toFixed(2)} hours)</p>` : ''}
         `;
+        
+        if (animationSpeed && animationSpeed > 1) {
+            info += `<p style="margin-top: 8px; padding: 6px; background: rgba(76, 175, 80, 0.2); border-left: 3px solid #4CAF50; border-radius: 3px;">
+                <strong style="color: #4CAF50;">⚡ Animation:</strong> ${animationSpeed.toLocaleString()}x speed<br>
+                <small style="color: #ccc;">One orbit in 30 seconds</small>
+            </p>`;
+        }
+        
+        info += `<p style="margin-top: 10px; font-size: 11px; color: #999;"><em>Click elsewhere to deselect</em></p>`;
         
         infoDiv.innerHTML = info;
         infoDiv.style.display = 'block';
@@ -505,6 +766,11 @@ class DebrisVisualizer {
 
         for (const [noradId, entity] of this.entities) {
             if (updated >= updateCount) break;
+            
+            // Skip animated entities (they update themselves via CallbackProperty)
+            if (entity._isAnimated) {
+                continue;
+            }
 
             try {
                 const satrec = entity.properties?.satrec?.getValue();
