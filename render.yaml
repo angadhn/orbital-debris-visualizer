@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: orbital-debris-visualizer
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: DATA_SOURCE
+        value: spacetrack
+      # Add these in Render dashboard:
+      # SPACETRACK_USERNAME
+      # SPACETRACK_PASSWORD
+      # CESIUM_ION_TOKEN (optional)
+
