@@ -61,13 +61,13 @@ class DebrisVisualizer {
         // Add equator line
         this.addEquator();
         
-        // Set initial camera position - Europe view with North Pole visible
-        // Center on Europe: ~10°E longitude, ~50°N latitude (central Europe)
+        // Set initial camera position - Equator view
+        // Center on equator: 0° longitude (Greenwich), 0° latitude (equator)
         this.viewer.camera.setView({
-            destination: Cesium.Cartesian3.fromDegrees(10, 50, 18000000), // Central Europe, zoomed out to see continent
+            destination: Cesium.Cartesian3.fromDegrees(0, 0, 20000000), // Equator at prime meridian, zoomed out
             orientation: {
                 heading: Cesium.Math.toRadians(0), // North up
-                pitch: Cesium.Math.toRadians(-50), // 50° down for better view
+                pitch: Cesium.Math.toRadians(-45), // 45° down for good equator view
                 roll: 0.0
             }
         });
