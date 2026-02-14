@@ -1,0 +1,193 @@
+name: Agent Loop Task
+
+# Triggered by repository_dispatch from agent-loop Edge Function
+on:
+  repository_dispatch:
+    types: [agent-loop-task]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  process:
+    # Only run on actual repository_dispatch events (not push/PR)
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better context
+
+      - name: Configure Git
+        run: |
+          git config user.name "Howler Agent"
+          git config user.email "agent@howler.pages.dev"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Claude Code
+        id: claude
+        env:
+          # Priority: OAuth token (MAX subscription), fallback to API key
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Write prompt to file (avoids shell escaping issues)
+          cat > /tmp/prompt.txt << 'PROMPT_EOF'
+          ${{ github.event.client_payload.prompt }}
+          PROMPT_EOF
+
+          # Run Claude Code with JSON output to capture usage stats
+          # --output-format json returns { result, usage, session_id, ... }
+          # stderr separated to keep JSON clean on stdout
+          claude -p --output-format json --model ${{ github.event.client_payload.model || 'opus' }} \
+            --dangerously-skip-permissions "$(cat /tmp/prompt.txt)" \
+            > /tmp/output.json 2>/tmp/claude_stderr.txt || true
+
+          # Extract text response from JSON (fallback to raw file if JSON parsing fails)
+          if jq -e '.result' /tmp/output.json > /dev/null 2>&1; then
+            jq -r '.result // empty' /tmp/output.json > /tmp/output.txt
+          else
+            echo "Warning: JSON parsing failed, using raw output" >&2
+            cat /tmp/claude_stderr.txt > /tmp/output.txt 2>/dev/null || true
+            cat /tmp/output.json >> /tmp/output.txt 2>/dev/null || true
+          fi
+
+          # Set response output
+          echo "response<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Extract usage stats for webhook (default to 0 if unavailable)
+          echo "input_tokens=$(jq -r '.usage.input_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "output_tokens=$(jq -r '.usage.output_tokens // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "cost_usd=$(jq -r '.total_cost_usd // 0' /tmp/output.json 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+
+      # CRITICAL: Safety commit for any uncommitted files
+      # GitHub Actions runners are ephemeral - files not committed are LOST
+      # This runs even if Claude Code fails/times out, ensuring no work is lost
+      - name: Safety Commit Uncommitted Files
+        if: always()
+        id: safety_commit
+        run: |
+          # Check if there are any uncommitted changes
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Found uncommitted files - creating safety commit"
+
+            # Get current branch (may have been created by Claude)
+            CURRENT_BRANCH=$(git branch --show-current)
+            echo "branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+
+            # Add all changes
+            git add -A
+
+            # Create safety commit with task ID for traceability
+            TASK_ID="${{ github.event.client_payload.task_id }}"
+            git commit -m "auto-save: uncommitted files from agent task
+
+            Task ID: ${TASK_ID:0:8}
+            Runner terminated before agent could commit these files.
+            Review and integrate or clean up as needed."
+
+            # Push to remote (create branch if needed)
+            git push -u origin "$CURRENT_BRANCH" || {
+              # If push fails (branch doesn't exist remotely), try with --set-upstream
+              git push --set-upstream origin "$CURRENT_BRANCH"
+            }
+
+            echo "Safety commit pushed to branch: $CURRENT_BRANCH"
+            echo "has_safety_commit=true" >> $GITHUB_OUTPUT
+          else
+            echo "No uncommitted files found"
+            echo "has_safety_commit=false" >> $GITHUB_OUTPUT
+            echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Webhook - Success
+        if: success()
+        env:
+          WEBHOOK_URL: ${{ github.event.client_payload.webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.HOWLER_AGENT_WEBHOOK_SECRET }}
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          RESPONSE: ${{ steps.claude.outputs.response }}
+          BRANCH: ${{ steps.safety_commit.outputs.branch }}
+          HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
+          INPUT_TOKENS: ${{ steps.claude.outputs.input_tokens }}
+          OUTPUT_TOKENS: ${{ steps.claude.outputs.output_tokens }}
+          COST_USD: ${{ steps.claude.outputs.cost_usd }}
+        run: |
+          # Build JSON payload to file (byte-identical for HMAC and curl)
+          jq -nc \
+            --arg task_id "$TASK_ID" \
+            --arg response "$RESPONSE" \
+            --arg branch "$BRANCH" \
+            --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
+            --argjson input_tokens "${INPUT_TOKENS:-0}" \
+            --argjson output_tokens "${OUTPUT_TOKENS:-0}" \
+            --argjson cost_usd "${COST_USD:-0}" \
+            '{
+              task_id: $task_id,
+              response: $response,
+              status: "success",
+              source: "github",
+              branch: $branch,
+              has_safety_commit: ($has_safety_commit == "true"),
+              usage: {
+                input_tokens: $input_tokens,
+                output_tokens: $output_tokens,
+                cost_usd: $cost_usd,
+                model: "${{ github.event.client_payload.model || 'opus' }}"
+              }
+            }' > /tmp/payload.json
+
+          # Compute HMAC-SHA256 signature from the file
+          SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" /tmp/payload.json | awk '{print $NF}')
+
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+            --data-binary @/tmp/payload.json
+
+          echo "Notified webhook of successful execution"
+
+      - name: Notify Webhook - Failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ github.event.client_payload.webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.HOWLER_AGENT_WEBHOOK_SECRET }}
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          BRANCH: ${{ steps.safety_commit.outputs.branch }}
+          HAS_SAFETY_COMMIT: ${{ steps.safety_commit.outputs.has_safety_commit }}
+        run: |
+          # Build JSON payload to file (byte-identical for HMAC and curl)
+          jq -nc \
+            --arg task_id "$TASK_ID" \
+            --arg branch "$BRANCH" \
+            --arg has_safety_commit "$HAS_SAFETY_COMMIT" \
+            '{
+              task_id: $task_id,
+              response: "GitHub Action failed. Check workflow logs for details.",
+              status: "failure",
+              source: "github",
+              branch: $branch,
+              has_safety_commit: ($has_safety_commit == "true")
+            }' > /tmp/payload.json
+
+          SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" /tmp/payload.json | awk '{print $NF}')
+
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+            --data-binary @/tmp/payload.json || true
+
+          echo "Notified webhook of failure"
